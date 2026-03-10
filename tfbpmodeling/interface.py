@@ -87,6 +87,7 @@ def linear_perturbation_binding_modeling(args):
         perturbed_tf=args.perturbed_tf,
         feature_blacklist_path=args.blacklist_file,
         top_n=args.top_n,
+        stage2_set_zero=args.stage2_set_zero,
     )
 
     logger.info("Step 2: Bootstrap LassoCV on all data, full interactor model")
@@ -119,6 +120,8 @@ def linear_perturbation_binding_modeling(args):
     else:
         all_data_formula = " + ".join(interaction_terms)
 
+
+    
     if args.squared_pTF:
         # if --squared_pTF is passed, then add the squared perturbed TF to the formula
         squared_term = f"I({input_data.perturbed_tf} ** 2)"
@@ -130,6 +133,7 @@ def linear_perturbation_binding_modeling(args):
         cubic_term = f"I({input_data.perturbed_tf} ** 3)"
         logger.info(f"Add cubic term to model formula: {cubic_term}")
         all_data_formula += f" + {cubic_term}"
+
 
     # if --row_max is passed, then add "row_max" to the formula
     if args.row_max:
@@ -163,103 +167,109 @@ def linear_perturbation_binding_modeling(args):
     logger.info(
         f"Running bootstrap LassoCV on all data with {args.n_bootstraps} bootstraps"
     )
-    if args.iterative_dropout:
-        logger.info("Using iterative dropout modeling for all data results.")
-        all_data_results = bootstrap_stratified_cv_loop(
-            bootstrapped_data=bootstrapped_data_all,
-            perturbed_tf_series=input_data.predictors_df[input_data.perturbed_tf],
-            estimator=estimator,
-            ci_percentile=float(args.all_data_ci_level),
-            stabilization_ci_start=args.stabilization_ci_start,
-            bins=args.bins,
-            output_dir=output_subdir,
-        )
+
+    if args.skip_1st_stage:
+        logger.info("Skipping Stage 1 bootstrap filtering. Using all terms for Stage 2.")
+        # Simply use the full formula we built for Step 2
+        all_data_sig_coefs_formula = all_data_formula
     else:
-        logger.info("Using standard bootstrap modeling for all data results.")
-        all_data_results = bootstrap_stratified_cv_modeling(
-            bootstrapped_data=bootstrapped_data_all,
-            perturbed_tf_series=input_data.predictors_df[input_data.perturbed_tf],
-            estimator=estimator,
-            ci_percentiles=[float(args.all_data_ci_level)],
+        if args.iterative_dropout:
+            logger.info("Using iterative dropout modeling for all data results.")
+            all_data_results = bootstrap_stratified_cv_loop(
+                bootstrapped_data=bootstrapped_data_all,
+                perturbed_tf_series=input_data.predictors_df[input_data.perturbed_tf],
+                estimator=estimator,
+                ci_percentile=float(args.all_data_ci_level),
+                stabilization_ci_start=args.stabilization_ci_start,
+                bins=args.bins,
+                output_dir=output_subdir,
+            )
+        else:
+            logger.info("Using standard bootstrap modeling for all data results.")
+            all_data_results = bootstrap_stratified_cv_modeling(
+                bootstrapped_data=bootstrapped_data_all,
+                perturbed_tf_series=input_data.predictors_df[input_data.perturbed_tf],
+                estimator=estimator,
+                ci_percentiles=[float(args.all_data_ci_level)],
+                bins=args.bins,
+            )
+        # create the all data object output subdir
+        all_data_output = os.path.join(output_subdir, "all_data_result_object")
+        os.makedirs(all_data_output, exist_ok=True)
+
+        logger.info(f"Serializing all data results to {all_data_output}")
+        all_data_results.serialize("result_obj", all_data_output)
+
+        # Extract the coefficients that are significant at the specified confidence level
+        all_data_sig_coefs = all_data_results.extract_significant_coefficients(
+            ci_level=args.all_data_ci_level,
+        )
+
+        logger.info(f"all_data_sig_coefs: {all_data_sig_coefs}")
+
+        if not all_data_sig_coefs:
+            logger.warning(
+                f"No significant coefficients found at {args.all_data_ci_level}% "
+                "confidence level. Exiting."
+            )
+            return
+
+        # write all_data_sig_coefs to a json file
+        all_data_ci_str = str(args.all_data_ci_level).replace(".", "-")
+        all_data_output_file = os.path.join(
+            output_subdir, f"all_data_significant_{all_data_ci_str}.json"
+        )
+        logger.info(f"Writing the all data significant results to {all_data_output_file}")
+        with open(
+            all_data_output_file,
+            "w",
+        ) as f:
+            json.dump(all_data_sig_coefs, f, indent=4)
+
+        # extract the significant coefficients and create a formula.
+        all_data_sig_coefs_formula = f"{' + '.join(all_data_sig_coefs.keys())}"
+        logger.debug(f"`all_data_sig_coefs_formula` formula: {all_data_sig_coefs_formula}")
+
+        logger.info(
+            "Step 3: Bootstrap LassoCV on the significant coefficients "
+            "from the all data model. This produces the best model for all data"
+        )
+
+        skf = StratifiedKFold(n_splits=4, shuffle=True, random_state=42)
+        classes = stratification_classification(
+            input_data.predictors_df[input_data.perturbed_tf].squeeze(),
             bins=args.bins,
         )
-    # create the all data object output subdir
-    all_data_output = os.path.join(output_subdir, "all_data_result_object")
-    os.makedirs(all_data_output, exist_ok=True)
 
-    logger.info(f"Serializing all data results to {all_data_output}")
-    all_data_results.serialize("result_obj", all_data_output)
-
-    # Extract the coefficients that are significant at the specified confidence level
-    all_data_sig_coefs = all_data_results.extract_significant_coefficients(
-        ci_level=args.all_data_ci_level,
-    )
-
-    logger.info(f"all_data_sig_coefs: {all_data_sig_coefs}")
-
-    if not all_data_sig_coefs:
-        logger.warning(
-            f"No significant coefficients found at {args.all_data_ci_level}% "
-            "confidence level. Exiting."
+        best_all_data_model_df = input_data.get_modeling_data(
+            all_data_sig_coefs_formula,
+            add_row_max=args.row_max,
+            drop_intercept=True,
+            scale_by_std=args.scale_by_std,
         )
-        return
+        best_all_data_model = stratified_cv_modeling(
+            input_data.response_df,
+            best_all_data_model_df,
+            classes=classes,
+            estimator=estimator,
+            skf=skf,
+            sample_weight=None,
+        )
 
-    # write all_data_sig_coefs to a json file
-    all_data_ci_str = str(args.all_data_ci_level).replace(".", "-")
-    all_data_output_file = os.path.join(
-        output_subdir, f"all_data_significant_{all_data_ci_str}.json"
-    )
-    logger.info(f"Writing the all data significant results to {all_data_output_file}")
-    with open(
-        all_data_output_file,
-        "w",
-    ) as f:
-        json.dump(all_data_sig_coefs, f, indent=4)
+        # save the best all data model to file with metadata
+        best_model_file = os.path.join(output_subdir, "best_all_data_model.pkl")
+        logger.info(f"Saving the best all data model to {best_model_file}")
 
-    # extract the significant coefficients and create a formula.
-    all_data_sig_coefs_formula = f"{' + '.join(all_data_sig_coefs.keys())}"
-    logger.debug(f"`all_data_sig_coefs_formula` formula: {all_data_sig_coefs_formula}")
-
-    logger.info(
-        "Step 3: Bootstrap LassoCV on the significant coefficients "
-        "from the all data model. This produces the best model for all data"
-    )
-
-    skf = StratifiedKFold(n_splits=4, shuffle=True, random_state=42)
-    classes = stratification_classification(
-        input_data.predictors_df[input_data.perturbed_tf].squeeze(),
-        bins=args.bins,
-    )
-
-    best_all_data_model_df = input_data.get_modeling_data(
-        all_data_sig_coefs_formula,
-        add_row_max=args.row_max,
-        drop_intercept=True,
-        scale_by_std=args.scale_by_std,
-    )
-    best_all_data_model = stratified_cv_modeling(
-        input_data.response_df,
-        best_all_data_model_df,
-        classes=classes,
-        estimator=estimator,
-        skf=skf,
-        sample_weight=None,
-    )
-
-    # save the best all data model to file with metadata
-    best_model_file = os.path.join(output_subdir, "best_all_data_model.pkl")
-    logger.info(f"Saving the best all data model to {best_model_file}")
-
-    # Bundle model with metadata so feature names are preserved
-    model_bundle = {
-        "model": best_all_data_model,
-        "feature_names": list(best_all_data_model_df.columns),
-        "formula": all_data_sig_coefs_formula,
-        "perturbed_tf": input_data.perturbed_tf,
-        "scale_by_std": args.scale_by_std,
-        "drop_intercept": True,
-    }
-    joblib.dump(model_bundle, best_model_file)
+        # Bundle model with metadata so feature names are preserved
+        model_bundle = {
+            "model": best_all_data_model,
+            "feature_names": list(best_all_data_model_df.columns),
+            "formula": all_data_sig_coefs_formula,
+            "perturbed_tf": input_data.perturbed_tf,
+            "scale_by_std": args.scale_by_std,
+            "drop_intercept": True,
+        }
+        joblib.dump(model_bundle, best_model_file)
 
     logger.info(
         "Step 4: Running LassoCV on topn data with significant coefficients "
@@ -324,6 +334,105 @@ def linear_perturbation_binding_modeling(args):
     logger.info(f"Writing the topn significant results to {topn_output_file}")
     with open(topn_output_file, "w") as f:
         json.dump(topn_output_res, f, indent=4)
+
+    # ==========================================
+    # NEW CODE: Stage 3 (2b) Implementation
+    # ==========================================
+    if args.stage3_2b:
+        logger.info(
+            "Step 3 2b: Re-running Stage 1 bootstrap with surviving "
+            "interactors and their independent main effects."
+        )
+        
+        # 1. Revert to all data (same configuration as Stage 1)
+        input_data.top_n_masked = False
+        
+        # 2. Extract surviving interactors and their independent variables
+        surviving_interactors = list(topn_output_res.keys())
+        independent_effects = []
+        
+        for term in surviving_interactors:
+            if ":" in term:
+                parts = term.split(":")
+                # The independent effect is the part that is NOT the perturbed_tf
+                indep = parts[1] if parts[0] == input_data.perturbed_tf else parts[0]
+                if indep not in independent_effects:
+                    independent_effects.append(indep)
+        
+        # 3. Build the new Stage 3 formula
+        stage3_terms = surviving_interactors + independent_effects
+        stage3_formula = " + ".join(stage3_terms)
+        
+        # Add the baseline/global modifiers back in if they were requested
+        if args.ptf_main_effect and input_data.perturbed_tf not in stage3_formula:
+            stage3_formula = f"{input_data.perturbed_tf} + {stage3_formula}"
+        if args.squared_pTF:
+            stage3_formula += f" + I({input_data.perturbed_tf} ** 2)"
+        if args.cubic_pTF:
+            stage3_formula += f" + I({input_data.perturbed_tf} ** 3)"
+        if args.row_max:
+            stage3_formula += " + row_max"
+        if args.add_model_variables:
+            stage3_formula += " + " + " + ".join(args.add_model_variables)
+
+        logger.debug(f"Stage 3 2b formula: {stage3_formula}")
+
+        # 4. Generate bootstrapped data for Stage 3
+        bootstrapped_data_stage3 = BootstrappedModelingInputData(
+            response_df=input_data.response_df,
+            model_df=input_data.get_modeling_data(
+                stage3_formula,
+                add_row_max=args.row_max,
+                drop_intercept=True,
+                scale_by_std=args.scale_by_std,
+            ),
+            n_bootstraps=args.n_bootstraps,
+            normalize_sample_weights=args.normalize_sample_weights,
+            random_state=args.random_state,
+        )
+
+        logger.info(f"Running Stage 3 2b bootstrap LassoCV with {args.n_bootstraps} bootstraps")
+
+        # 5. Run the model using the Stage 1 configurations
+        if args.iterative_dropout:
+            stage3_results = bootstrap_stratified_cv_loop(
+                bootstrapped_data=bootstrapped_data_stage3,
+                perturbed_tf_series=input_data.predictors_df[input_data.perturbed_tf],
+                estimator=estimator,
+                ci_percentile=float(args.all_data_ci_level),
+                stabilization_ci_start=args.stabilization_ci_start,
+                bins=args.bins,
+                output_dir=output_subdir,
+            )
+        else:
+            stage3_results = bootstrap_stratified_cv_modeling(
+                bootstrapped_data=bootstrapped_data_stage3,
+                perturbed_tf_series=input_data.predictors_df[input_data.perturbed_tf],
+                estimator=estimator,
+                ci_percentiles=[float(args.all_data_ci_level)],
+                bins=args.bins,
+            )
+
+        # 6. Serialize and save the Stage 3 results
+        stage3_output_dir = os.path.join(output_subdir, "stage3_result_object")
+        os.makedirs(stage3_output_dir, exist_ok=True)
+        stage3_results.serialize("result_obj", stage3_output_dir)
+
+        stage3_sig_coefs = stage3_results.extract_significant_coefficients(
+            ci_level=args.all_data_ci_level,
+        )
+
+        stage3_ci_str = str(args.all_data_ci_level).replace(".", "-")
+        stage3_output_file = os.path.join(
+            output_subdir, f"stage3_2b_significant_{stage3_ci_str}.json"
+        )
+        logger.info(f"Writing Stage 3 2b significant results to {stage3_output_file}")
+        with open(stage3_output_file, "w") as f:
+            json.dump(stage3_sig_coefs, f, indent=4)
+
+    # ==========================================
+    # END NEW CODE
+    # ==========================================
 
     logger.info(
         "Step 5: Test the significance of the interactor terms that survive "
@@ -579,3 +688,28 @@ def common_modeling_feature_options(parser: argparse._ArgumentGroup) -> None:
             "modeling formula. This is added to the all_data model formula."
         ),
     )
+    parser.add_argument(
+        "--stage2_set_zero",
+        action="store_true",
+        help=(
+            "Set all non-top LRB interactions to be zero in the stage 2 model."
+        ),
+    )
+
+    parser.add_argument(
+        "--skip_1st_stage",
+        action="store_true",
+        help=(
+            "Skip the first stage of modeling and go directly to the second stage."
+        ),
+    )
+
+    parser.add_argument(
+        "--stage3_2b",
+        dest="stage3_2b",
+        action="store_true",
+        help=(
+            "For stage 3, rerun the stage 1 bootstrap with independent and interactor effects from stage 2"
+        ),
+    )
+

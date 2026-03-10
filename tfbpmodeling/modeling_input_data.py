@@ -33,6 +33,7 @@ class ModelingInputData:
         feature_col: str = "target_symbol",
         feature_blacklist: list[str] | None = None,
         top_n: int | None = None,
+        stage2_set_zero: bool = False, 
     ):
         """
         Initialize ModelingInputData with response and predictor matrices. Note that the
@@ -96,36 +97,34 @@ class ModelingInputData:
         # Ensure the response and predictors only contain common features
         self.response_df = response_df
         self.predictors_df = predictors_df
-
+        self.stage2_set_zero = stage2_set_zero
         # Assign top_n value
         self.top_n = top_n
 
     @property
     def response_df(self) -> pd.DataFrame:
-        """
-        Get the response DataFrame with feature masks applied.
-
-        Returns a version of the response matrix filtered by:
-        - Feature blacklist (if `blacklist_masked` is True)
-        - Top-N feature selection (if `top_n_masked` is True)
-
-        The final DataFrame will be aligned in index order with the predictors matrix.
-
-        :return: Filtered and ordered response DataFrame.
-
-        """
         response_df = self._response_df.copy()
 
-        # Apply blacklist masking
+        # Always drop blacklisted features
         if self.blacklist_masked:
             response_df = response_df.loc[
+                # Use intersection to ensure we only try to drop what exists
                 response_df.index.difference(self.feature_blacklist)
             ]
 
-        # Apply top-n feature masking
+        # Handle Top-N logic
         if self.top_n_masked and self.top_n_features:
-            response_df = response_df.loc[self.top_n_features]
-            response_df = response_df.reindex(self.predictors_df.index)
+            if self.stage2_set_zero:
+                # DO NOTHING to the values. 
+                # Because we didn't use .loc[self.top_n_features], 
+                # all rows remain with their original LRR values.
+                pass
+            else:
+                # Original behavior: Drop the rows to match the filtered predictors
+                response_df = response_df.loc[self.top_n_features]
+        
+        # Always ensure the response order matches the predictors order
+        response_df = response_df.reindex(self.predictors_df.index)
 
         return response_df
 
@@ -174,23 +173,23 @@ class ModelingInputData:
 
     @property
     def predictors_df(self) -> pd.DataFrame:
-        """
-        Get the predictors DataFrame with feature masks applied.
-
-        The returned DataFrame reflects any active blacklist or top-N filtering.
-
-        """
         predictors_df = self._predictors_df.copy()
 
-        # Apply blacklist masking
+        # Apply blacklist masking (usually still want to drop these)
         if self.blacklist_masked:
             predictors_df = predictors_df.loc[
                 predictors_df.index.difference(self.feature_blacklist)
             ]
 
-        # Apply top-n feature masking
+        # New Top-N Logic
         if self.top_n_masked and self.top_n_features:
-            predictors_df = predictors_df.loc[self.top_n_features, :]
+            if self.stage2_set_zero:
+                # Set all rows NOT in top_n_features to 0.0
+                mask = ~predictors_df.index.isin(self.top_n_features)
+                predictors_df.loc[mask, :] = 0.0 
+            else:
+                # Original behavior: Drop the rows entirely
+                predictors_df = predictors_df.loc[self.top_n_features, :]
 
         return predictors_df
 
@@ -445,6 +444,7 @@ class ModelingInputData:
         feature_col: str = "target_symbol",
         feature_blacklist_path: str | None = None,
         top_n: int = 600,
+        stage2_set_zero: bool = False,
     ) -> "ModelingInputData":
         """
         Load response and predictor data from files. This would be considered an
@@ -489,4 +489,5 @@ class ModelingInputData:
             feature_col,
             feature_blacklist,
             top_n,
+            stage2_set_zero,
         )
